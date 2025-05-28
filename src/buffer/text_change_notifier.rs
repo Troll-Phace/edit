@@ -76,6 +76,16 @@ impl TextChangeNotification {
             TextChangeType::Delete,
         )
     }
+
+    /// Creates a notification for a text replacement.
+    pub fn replace(start_line: usize, end_line: usize, line_delta: isize) -> Self {
+        Self::new(
+            start_line,
+            end_line,
+            line_delta,
+            TextChangeType::Replace,
+        )
+    }
 }
 
 /// Notifies the highlighting system about text changes.
@@ -161,6 +171,19 @@ pub fn notify_undo_redo(
     notify_text_change(buffer, &notification);
 }
 
+/// Notifies about a find-and-replace operation.
+/// This should be called when text is replaced via find/replace functionality.
+#[allow(dead_code)]
+pub fn notify_replace_operation(
+    buffer: &TextBuffer,
+    start_line: usize,
+    end_line: usize,
+    line_delta: isize,
+) {
+    let notification = TextChangeNotification::replace(start_line, end_line, line_delta);
+    notify_text_change(buffer, &notification);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +207,12 @@ mod tests {
         assert_eq!(notif.end_line, 20);
         assert_eq!(notif.line_delta, -2);
         assert_eq!(notif.change_type, TextChangeType::Delete);
+
+        let notif = TextChangeNotification::replace(15, 18, 1);
+        assert_eq!(notif.start_line, 15);
+        assert_eq!(notif.end_line, 18);
+        assert_eq!(notif.line_delta, 1);
+        assert_eq!(notif.change_type, TextChangeType::Replace);
     }
 
     #[test]

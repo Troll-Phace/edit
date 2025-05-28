@@ -70,7 +70,3 @@ fn render_with_tokens(
     }
 }
 
-/// Checks if syntax highlighting is available for a buffer.
-pub fn is_highlighting_available(buffer: &TextBuffer) -> bool {
-    crate::syntax::render_bridge::get_buffer_highlighting(buffer).is_some()
-}

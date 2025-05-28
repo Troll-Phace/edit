@@ -2254,20 +2254,20 @@ impl TextBuffer {
             return;
         }
 
-        #[cfg(debug_assertions)]
-        {
-            let entry = self.undo_stack.back_mut().unwrap().borrow_mut();
-            debug_assert!(!entry.deleted.is_empty() || !entry.added.is_empty());
-        }
-
         // Notify highlighting system about the text change
-        let (cursor_before, cursor_after, was_deletion) = {
-            let entry = self.undo_stack.back_mut().unwrap().borrow();
-            let cursor_before = entry.cursor;
-            let cursor_after = self.cursor.logical_pos;
-            let was_deletion = !entry.deleted.is_empty();
-            (cursor_before, cursor_after, was_deletion)
-        };
+        // Extract data needed for notification before calling it
+        let cursor_before;
+        let was_deletion;
+        {
+            let entry = self.undo_stack.back().unwrap().borrow();
+            #[cfg(debug_assertions)]
+            debug_assert!(!entry.deleted.is_empty() || !entry.added.is_empty());
+            
+            cursor_before = entry.cursor;
+            was_deletion = !entry.deleted.is_empty();
+        } // Ensure borrow is definitely dropped here
+        
+        let cursor_after = self.cursor.logical_pos;
         
         text_change_notifier::notify_edit_operation(
             self,
