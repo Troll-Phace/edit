@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use edit::buffer::{RcTextBuffer, TextBuffer};
 use edit::helpers::{CoordType, Point};
 use edit::simd::memrchr2;
+use edit::syntax::{HighlightingState, global_highlighting_service};
 use edit::{apperr, path, sys};
 
 use crate::state::DisplayablePathBuf;
@@ -20,6 +21,8 @@ pub struct Document {
     pub filename: String,
     pub file_id: Option<sys::FileId>,
     pub new_file_counter: usize,
+    /// Syntax highlighting state for this document (Phase 0)
+    pub highlighting_state: HighlightingState,
 }
 
 impl Document {
@@ -64,7 +67,14 @@ impl Document {
         let dir = path.parent().map(ToOwned::to_owned).unwrap_or_default();
         self.filename = filename;
         self.dir = Some(DisplayablePathBuf::from_path(dir));
-        self.path = Some(path);
+        self.path = Some(path.clone());
+        
+        // Update highlighting state for the new file type
+        {
+            let mut service = global_highlighting_service();
+            self.highlighting_state = service.create_highlighting_state(&path);
+        }
+        
         self.update_file_mode();
     }
 
@@ -122,6 +132,10 @@ impl DocumentManager {
             filename: Default::default(),
             file_id: None,
             new_file_counter: 0,
+            highlighting_state: {
+                let mut service = global_highlighting_service();
+                service.create_highlighting_state("Untitled.txt")
+            },
         };
         self.gen_untitled_name(&mut doc);
 
@@ -182,6 +196,10 @@ impl DocumentManager {
             filename: Default::default(),
             file_id,
             new_file_counter: 0,
+            highlighting_state: {
+                let mut service = global_highlighting_service();
+                service.create_highlighting_state(&path)
+            },
         };
         doc.set_path(path);
 
