@@ -11,6 +11,10 @@ license = "MIT"
 name = "lib"
 harness = false
 
+[[bin]]
+name = "baseline"
+path = "src/bin/baseline.rs"
+
 [features]
 debug-layout = []
 debug-latency = []
@@ -33,6 +37,10 @@ codegen-units = 16          # Make compiling criterion faster (16 is the default
 lto = "thin"                # Similarly, speed up linking by a ton
 
 [dependencies]
+# Syntax highlighting dependencies for Phase 0
+synoptic = "2.2.9"
+once_cell = "1.19"
+regex = "1.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
