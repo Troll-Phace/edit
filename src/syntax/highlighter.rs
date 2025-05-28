@@ -6,7 +6,7 @@
 //! This module provides the core syntax highlighting functionality using Synoptic,
 //! including lazy initialization, token processing, and performance monitoring.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
@@ -140,6 +140,10 @@ pub struct HighlightingState {
     token_cache: HashMap<usize, Vec<TokenInfo>>,
     /// Cache validity tracking (line_number -> content_hash)
     cache_validity: HashMap<usize, u64>,
+    /// Track which lines need re-highlighting
+    dirty_lines: HashSet<usize>,
+    /// Track if entire document needs re-highlighting
+    needs_full_rehighlight: bool,
 }
 
 impl HighlightingState {
@@ -152,6 +156,8 @@ impl HighlightingState {
             metrics: HighlightingMetrics::default(),
             token_cache: HashMap::new(),
             cache_validity: HashMap::new(),
+            dirty_lines: HashSet::new(),
+            needs_full_rehighlight: false,
         }
     }
 
@@ -164,6 +170,8 @@ impl HighlightingState {
             metrics: HighlightingMetrics::default(),
             token_cache: HashMap::new(),
             cache_validity: HashMap::new(),
+            dirty_lines: HashSet::new(),
+            needs_full_rehighlight: false,
         }
     }
 
@@ -207,6 +215,113 @@ impl HighlightingState {
     pub fn cache_size(&self) -> usize {
         self.token_cache.len()
     }
+
+    /// Mark a line as needing re-highlighting.
+    pub fn mark_line_dirty(&mut self, line_number: usize) {
+        self.dirty_lines.insert(line_number);
+        self.invalidate_line_cache(line_number);
+    }
+
+    /// Mark a range of lines as needing re-highlighting.
+    pub fn mark_lines_dirty(&mut self, start_line: usize, end_line: usize) {
+        for line in start_line..=end_line {
+            self.dirty_lines.insert(line);
+        }
+        self.invalidate_line_range_cache(start_line, end_line);
+    }
+
+    /// Mark the entire document as needing re-highlighting.
+    pub fn mark_document_dirty(&mut self) {
+        self.needs_full_rehighlight = true;
+        self.clear_cache();
+        self.dirty_lines.clear();
+    }
+
+    /// Check if a line needs re-highlighting.
+    pub fn is_line_dirty(&self, line_number: usize) -> bool {
+        self.needs_full_rehighlight || self.dirty_lines.contains(&line_number)
+    }
+
+    /// Clear dirty state for a line after re-highlighting.
+    pub fn clear_line_dirty(&mut self, line_number: usize) {
+        self.dirty_lines.remove(&line_number);
+    }
+
+    /// Clear all dirty state.
+    pub fn clear_all_dirty(&mut self) {
+        self.dirty_lines.clear();
+        self.needs_full_rehighlight = false;
+    }
+
+    /// Handle text insertion at a specific location.
+    /// This marks affected lines as dirty for re-highlighting.
+    pub fn handle_text_insert(&mut self, line_number: usize, lines_added: usize) {
+        // Mark the current line as dirty
+        self.mark_line_dirty(line_number);
+        
+        // If multiple lines were added, mark them all as dirty
+        if lines_added > 0 {
+            self.mark_lines_dirty(line_number, line_number + lines_added);
+        }
+        
+        // Shift cache entries for lines after the insertion point
+        let mut new_cache = HashMap::new();
+        let mut new_validity = HashMap::new();
+        
+        for (line, tokens) in self.token_cache.drain() {
+            if line >= line_number {
+                new_cache.insert(line + lines_added, tokens);
+            } else {
+                new_cache.insert(line, tokens);
+            }
+        }
+        
+        for (line, hash) in self.cache_validity.drain() {
+            if line >= line_number {
+                new_validity.insert(line + lines_added, hash);
+            } else {
+                new_validity.insert(line, hash);
+            }
+        }
+        
+        self.token_cache = new_cache;
+        self.cache_validity = new_validity;
+    }
+
+    /// Handle text deletion at a specific location.
+    /// This marks affected lines as dirty for re-highlighting.
+    pub fn handle_text_delete(&mut self, start_line: usize, lines_deleted: usize) {
+        // Mark the current line as dirty
+        self.mark_line_dirty(start_line);
+        
+        // Remove cache entries for deleted lines
+        for line in start_line..start_line + lines_deleted {
+            self.invalidate_line_cache(line);
+        }
+        
+        // Shift cache entries for lines after the deletion point
+        let mut new_cache = HashMap::new();
+        let mut new_validity = HashMap::new();
+        
+        for (line, tokens) in self.token_cache.drain() {
+            if line >= start_line + lines_deleted {
+                new_cache.insert(line - lines_deleted, tokens);
+            } else if line < start_line {
+                new_cache.insert(line, tokens);
+            }
+        }
+        
+        for (line, hash) in self.cache_validity.drain() {
+            if line >= start_line + lines_deleted {
+                new_validity.insert(line - lines_deleted, hash);
+            } else if line < start_line {
+                new_validity.insert(line, hash);
+            }
+        }
+        
+        self.token_cache = new_cache;
+        self.cache_validity = new_validity;
+    }
 }
 
 /// A wrapper around Synoptic's Highlighter with additional functionality.
@@ -238,9 +353,6 @@ impl SyntaxHighlighter {
             return Ok(());
         }
 
-        // For Phase 0, we create a mock highlighter that doesn't actually highlight
-        // In Phase 1, this will be replaced with actual Synoptic highlighter initialization
-        
         // Try to create a Synoptic highlighter from extension
         let extension = self.language.primary_extension();
         match synoptic::from_extension(extension, 4) { // 4-space tabs
@@ -250,37 +362,94 @@ impl SyntaxHighlighter {
                 Ok(())
             }
             None => {
-                // For Phase 0, we'll create a basic highlighter manually
-                // This ensures the infrastructure works even for unsupported languages
+                // Create a highlighter manually for languages not supported by Synoptic
                 let mut highlighter = Highlighter::new(4); // 4-space tabs
                 
-                // Add basic highlighting rules based on language
+                // Add comprehensive highlighting rules for Phase 1 languages
                 match self.language {
                     Language::Rust => {
-                        highlighter.keyword("keyword", r"\b(fn|let|mut|pub|struct|enum|impl|trait|use|mod|const|static|if|else|match|for|while|loop|break|continue|return)\b");
-                        highlighter.keyword("string", r#""[^"]*""#);
+                        // Keywords
+                        highlighter.keyword("keyword", r"\b(as|async|await|break|const|continue|crate|dyn|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while)\b");
+                        
+                        // Types
+                        highlighter.keyword("type", r"\b(bool|char|f32|f64|i8|i16|i32|i64|i128|isize|str|u8|u16|u32|u64|u128|usize|String|Vec|Option|Result|Box|Rc|Arc)\b");
+                        
+                        // Strings
+                        highlighter.bounded_interp("string", "\"", "\"", "\\{", "\\}", true);
+                        highlighter.keyword("string", r"'[^']*'");
+                        highlighter.keyword("string", r##"r#*".*?"#*"##);
+                        
+                        // Comments
                         highlighter.keyword("comment", r"//.*$");
                         highlighter.bounded("comment", r"/\*", r"\*/", false);
+                        
+                        // Numbers
+                        highlighter.keyword("number", r"\b\d+(\.\d+)?([eE][+-]?\d+)?(f32|f64|i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?\b");
+                        
+                        // Attributes
+                        highlighter.keyword("attribute", r"#\[.*?\]");
                     }
                     Language::JavaScript | Language::TypeScript => {
-                        highlighter.keyword("keyword", r"\b(function|var|let|const|if|else|for|while|do|switch|case|break|continue|return|class|extends|import|export|from|default)\b");
-                        highlighter.keyword("string", r#""[^"]*"|'[^']*'|`[^`]*`"#);
+                        // Keywords
+                        highlighter.keyword("keyword", r"\b(async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|of|return|super|switch|this|throw|try|typeof|var|void|while|with|yield)\b");
+                        
+                        // Built-in objects
+                        highlighter.keyword("type", r"\b(Array|Boolean|Date|Error|Function|JSON|Map|Math|Number|Object|Promise|RegExp|Set|String|Symbol|console|document|window)\b");
+                        
+                        // Strings
+                        highlighter.bounded("string", "\"", "\"", true);
+                        highlighter.bounded("string", "'", "'", true);
+                        highlighter.bounded_interp("string", "`", "`", "${", "}", true);
+                        
+                        // Comments
                         highlighter.keyword("comment", r"//.*$");
                         highlighter.bounded("comment", r"/\*", r"\*/", false);
+                        
+                        // Numbers
+                        highlighter.keyword("number", r"\b\d+(\.\d+)?([eE][+-]?\d+)?\b");
+                        
+                        // Regex
+                        highlighter.keyword("regex", r"/[^/\n]+/[gimuy]*");
                     }
                     Language::Python => {
-                        highlighter.keyword("keyword", r"\b(def|class|if|elif|else|for|while|try|except|finally|with|import|from|as|return|yield|lambda|pass|break|continue)\b");
-                        highlighter.keyword("string", r#""[^"]*"|'[^']*'|"""[\s\S]*?"""|'''[\s\S]*?'''"#);
+                        // Keywords
+                        highlighter.keyword("keyword", r"\b(and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|nonlocal|not|or|pass|raise|return|True|try|while|with|yield)\b");
+                        
+                        // Built-in functions
+                        highlighter.keyword("builtin", r"\b(abs|all|any|ascii|bin|bool|breakpoint|bytearray|bytes|callable|chr|classmethod|compile|complex|delattr|dict|dir|divmod|enumerate|eval|exec|filter|float|format|frozenset|getattr|globals|hasattr|hash|help|hex|id|input|int|isinstance|issubclass|iter|len|list|locals|map|max|memoryview|min|next|object|oct|open|ord|pow|print|property|range|repr|reversed|round|set|setattr|slice|sorted|staticmethod|str|sum|super|tuple|type|vars|zip)\b");
+                        
+                        // Strings
+                        highlighter.bounded("string", "\"\"\"", "\"\"\"", false);
+                        highlighter.bounded("string", "'''", "'''", false);
+                        highlighter.bounded("string", "\"", "\"", true);
+                        highlighter.bounded("string", "'", "'", true);
+                        highlighter.keyword("string", r#"[rf]"[^"]*"|[rf]'[^']*'"#);
+                        
+                        // Comments
                         highlighter.keyword("comment", r"#.*$");
+                        
+                        // Numbers
+                        highlighter.keyword("number", r"\b\d+(\.\d+)?([eE][+-]?\d+)?\b");
+                        highlighter.keyword("number", r"\b0[xX][0-9a-fA-F]+\b");
+                        highlighter.keyword("number", r"\b0[bB][01]+\b");
+                        highlighter.keyword("number", r"\b0[oO][0-7]+\b");
+                        
+                        // Decorators
+                        highlighter.keyword("decorator", r"@\w+");
                     }
                     Language::Json => {
-                        highlighter.keyword("string", r#""[^"]*""#);
-                        highlighter.keyword("number", r"\b\d+(\.\d+)?\b");
+                        // Strings
+                        highlighter.bounded("string", "\"", "\"", true);
+                        
+                        // Numbers
+                        highlighter.keyword("number", r"-?\b\d+(\.\d+)?([eE][+-]?\d+)?\b");
+                        
+                        // Booleans and null
                         highlighter.keyword("boolean", r"\b(true|false|null)\b");
                     }
                     _ => {
-                        // For other languages, just add basic string and comment highlighting
-                        highlighter.keyword("string", r#""[^"]*""#);
+                        // For other languages, add basic string and comment highlighting
+                        highlighter.bounded("string", "\"", "\"", true);
                         highlighter.keyword("comment", r"//.*$|#.*$");
                     }
                 }
@@ -293,126 +462,121 @@ impl SyntaxHighlighter {
     }
 
     /// Highlights a single line of text and returns the tokens.
-    /// This is a mock implementation for Phase 0.
+    /// Note: For proper context-aware highlighting (e.g., multiline comments),
+    /// the entire document should be processed through `highlight_document` first.
     pub fn highlight_line(&mut self, line: &str, _line_number: usize) -> Result<Vec<TokenInfo>, String> {
-        // For Phase 0, we'll just return the line as a single plain text token
-        // This demonstrates the infrastructure without actual highlighting
-        
         // Ensure highlighter is initialized
         self.initialize()?;
 
-        // For Phase 0: Mock highlighting - just return the entire line as plain text
         if line.is_empty() {
             return Ok(Vec::new());
         }
 
+        // Get the highlighter
+        let highlighter = self.highlighter.as_mut().ok_or("Highlighter not initialized")?;
+
+        // For single-line highlighting, we run the highlighter on just this line
+        // This won't handle multiline tokens properly, but is fast for incremental updates
+        let lines = vec![line.to_string()];
+        highlighter.run(&lines);
+
+        // Get tokens for line 0 (since we're only processing one line)
         let mut tokens = Vec::new();
         let mut current_offset = 0;
 
-        // Simple mock highlighting: split on whitespace and create tokens
-        for word in line.split_whitespace() {
-            // Find the actual position of this word in the line
-            if let Some(word_start) = line[current_offset..].find(word) {
-                let actual_start = current_offset + word_start;
-                let actual_end = actual_start + word.len();
-
-                // Add whitespace before this word if any
-                if actual_start > current_offset {
-                    let whitespace = &line[current_offset..actual_start];
-                    tokens.push(TokenInfo::plain_text(
-                        whitespace.to_string(),
-                        current_offset,
-                        actual_start,
-                    ));
-                }
-
-                // Determine token type based on simple heuristics
-                let token_kind = self.classify_word(word);
-                
-                if let Some(kind) = token_kind {
+        // Process tokens from Synoptic
+        for token in highlighter.line(0, line) {
+            match token {
+                synoptic::TokOpt::Some(text, kind) => {
+                    let start = current_offset;
+                    let end = start + text.len();
+                    
                     tokens.push(TokenInfo::highlighted(
-                        word.to_string(),
-                        kind,
-                        actual_start,
-                        actual_end,
+                        text.to_string(),
+                        kind.to_string(),
+                        start,
+                        end,
                     ));
-                } else {
-                    tokens.push(TokenInfo::plain_text(
-                        word.to_string(),
-                        actual_start,
-                        actual_end,
-                    ));
+                    
+                    current_offset = end;
                 }
-
-                current_offset = actual_end;
+                synoptic::TokOpt::None(text) => {
+                    let start = current_offset;
+                    let end = start + text.len();
+                    
+                    tokens.push(TokenInfo::plain_text(
+                        text.to_string(),
+                        start,
+                        end,
+                    ));
+                    
+                    current_offset = end;
+                }
             }
         }
 
-        // Add any remaining whitespace at the end
-        if current_offset < line.len() {
-            let remaining = &line[current_offset..];
-            tokens.push(TokenInfo::plain_text(
-                remaining.to_string(),
-                current_offset,
-                line.len(),
-            ));
+        Ok(tokens)
+    }
+    
+    /// Highlights an entire document and returns tokens for a specific line.
+    /// This method provides proper context-aware highlighting for multiline tokens.
+    pub fn highlight_document(&mut self, document: &str, line_number: usize) -> Result<Vec<TokenInfo>, String> {
+        // Ensure highlighter is initialized
+        self.initialize()?;
+
+        // Get the highlighter
+        let highlighter = self.highlighter.as_mut().ok_or("Highlighter not initialized")?;
+
+        // Run the highlighter on the entire document
+        let lines: Vec<String> = document.lines().map(String::from).collect();
+        highlighter.run(&lines);
+
+        // Get the specific line from the document
+        let lines: Vec<&str> = document.lines().collect();
+        if line_number >= lines.len() {
+            return Ok(Vec::new());
+        }
+        
+        let line = lines[line_number];
+        
+        // Get tokens for the specific line
+        let mut tokens = Vec::new();
+        let mut current_offset = 0;
+
+        // Process tokens from Synoptic
+        for token in highlighter.line(line_number, line) {
+            match token {
+                synoptic::TokOpt::Some(text, kind) => {
+                    let start = current_offset;
+                    let end = start + text.len();
+                    
+                    tokens.push(TokenInfo::highlighted(
+                        text.to_string(),
+                        kind.to_string(),
+                        start,
+                        end,
+                    ));
+                    
+                    current_offset = end;
+                }
+                synoptic::TokOpt::None(text) => {
+                    let start = current_offset;
+                    let end = start + text.len();
+                    
+                    tokens.push(TokenInfo::plain_text(
+                        text.to_string(),
+                        start,
+                        end,
+                    ));
+                    
+                    current_offset = end;
+                }
+            }
         }
 
         Ok(tokens)
     }
 
-    /// Simple word classification for mock highlighting.
-    fn classify_word(&self, word: &str) -> Option<String> {
-        match self.language {
-            Language::Rust => {
-                if ["fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "use", "mod"].contains(&word) {
-                    Some("keyword".to_string())
-                } else if word.starts_with("//") || word.starts_with("/*") {
-                    Some("comment".to_string())
-                } else if word.starts_with('"') && word.ends_with('"') {
-                    Some("string".to_string())
-                } else {
-                    None
-                }
-            }
-            Language::JavaScript | Language::TypeScript => {
-                if ["function", "var", "let", "const", "if", "else", "for", "while", "class"].contains(&word) {
-                    Some("keyword".to_string())
-                } else if word.starts_with("//") || word.starts_with("/*") {
-                    Some("comment".to_string())
-                } else if (word.starts_with('"') && word.ends_with('"')) || 
-                         (word.starts_with('\'') && word.ends_with('\'')) {
-                    Some("string".to_string())
-                } else {
-                    None
-                }
-            }
-            Language::Python => {
-                if ["def", "class", "if", "elif", "else", "for", "while", "import", "from"].contains(&word) {
-                    Some("keyword".to_string())
-                } else if word.starts_with('#') {
-                    Some("comment".to_string())
-                } else if (word.starts_with('"') && word.ends_with('"')) || 
-                         (word.starts_with('\'') && word.ends_with('\'')) {
-                    Some("string".to_string())
-                } else {
-                    None
-                }
-            }
-            Language::Json => {
-                if ["true", "false", "null"].contains(&word) {
-                    Some("boolean".to_string())
-                } else if word.parse::<f64>().is_ok() {
-                    Some("number".to_string())
-                } else if word.starts_with('"') && word.ends_with('"') {
-                    Some("string".to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None
-        }
-    }
 
     /// Returns the language this highlighter is configured for.
     pub fn language(&self) -> Language {
@@ -436,6 +600,10 @@ pub struct HighlightingService {
     enabled: bool,
     /// Global performance metrics
     global_metrics: HighlightingMetrics,
+    /// Maximum time allowed for highlighting a single line
+    line_timeout: Duration,
+    /// Maximum line length before skipping highlighting
+    max_line_length: usize,
 }
 
 impl Default for HighlightingService {
@@ -452,6 +620,8 @@ impl HighlightingService {
             highlighters: HashMap::new(),
             enabled: true,
             global_metrics: HighlightingMetrics::default(),
+            line_timeout: Duration::from_millis(50), // 50ms per line timeout
+            max_line_length: 10_000, // Skip highlighting for lines longer than 10k characters
         }
     }
 
@@ -482,6 +652,15 @@ impl HighlightingService {
             )]);
         }
 
+        // Skip highlighting for extremely long lines
+        if line.len() > self.max_line_length {
+            return Ok(vec![TokenInfo::plain_text(
+                line.to_string(),
+                0,
+                line.len(),
+            )]);
+        }
+
         // Calculate content hash for caching
         let content_hash = self.calculate_line_hash(line);
         
@@ -498,10 +677,26 @@ impl HighlightingService {
             .entry(state.language)
             .or_insert_with(|| SyntaxHighlighter::new(state.language));
 
-        // Perform highlighting
+        // Perform highlighting with timeout protection
         let start_time = Instant::now();
+        
+        // For now, we perform the highlighting and check the duration after
+        // In a production system, you might want to use a separate thread with a timeout
         let tokens = highlighter.highlight_line(line, line_number)?;
         let duration = start_time.elapsed();
+
+        // If highlighting took too long, return plain text and mark line for skipping
+        if duration > self.line_timeout {
+            // Log that we exceeded timeout (in production, you'd use a proper logging system)
+            eprintln!("Syntax highlighting timeout for line {} ({}ms)", line_number, duration.as_millis());
+            
+            // Return plain text instead
+            return Ok(vec![TokenInfo::plain_text(
+                line.to_string(),
+                0,
+                line.len(),
+            )]);
+        }
 
         // Update metrics
         state.metrics.record_line_highlight(duration, tokens.len());
@@ -551,6 +746,26 @@ impl HighlightingService {
     /// Returns the number of cached highlighters.
     pub fn cached_highlighter_count(&self) -> usize {
         self.highlighters.len()
+    }
+
+    /// Sets the timeout for highlighting a single line.
+    pub fn set_line_timeout(&mut self, timeout: Duration) {
+        self.line_timeout = timeout;
+    }
+
+    /// Gets the current line timeout.
+    pub fn line_timeout(&self) -> Duration {
+        self.line_timeout
+    }
+
+    /// Sets the maximum line length before skipping highlighting.
+    pub fn set_max_line_length(&mut self, max_length: usize) {
+        self.max_line_length = max_length;
+    }
+
+    /// Gets the current maximum line length.
+    pub fn max_line_length(&self) -> usize {
+        self.max_line_length
     }
 
     /// Calculates a simple hash for line content caching.

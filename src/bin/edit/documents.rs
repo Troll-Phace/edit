@@ -1,15 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::cell::RefCell;
 use std::collections::LinkedList;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use edit::buffer::{RcTextBuffer, TextBuffer};
 use edit::helpers::{CoordType, Point};
 use edit::simd::memrchr2;
-use edit::syntax::{HighlightingState, global_highlighting_service};
+use edit::syntax::{HighlightingState, global_highlighting_service, register_buffer_highlighting};
 use edit::{apperr, path, sys};
 
 use crate::state::DisplayablePathBuf;
@@ -21,8 +23,8 @@ pub struct Document {
     pub filename: String,
     pub file_id: Option<sys::FileId>,
     pub new_file_counter: usize,
-    /// Syntax highlighting state for this document (Phase 0)
-    pub highlighting_state: HighlightingState,
+    /// Syntax highlighting state for this document
+    pub highlighting_state: Rc<RefCell<HighlightingState>>,
 }
 
 impl Document {
@@ -72,7 +74,11 @@ impl Document {
         // Update highlighting state for the new file type
         {
             let mut service = global_highlighting_service();
-            self.highlighting_state = service.create_highlighting_state(&path);
+            let new_state = service.create_highlighting_state(&path);
+            self.highlighting_state = Rc::new(RefCell::new(new_state));
+            
+            // Re-register with the new highlighting state
+            register_buffer_highlighting(&*self.buffer.borrow(), self.highlighting_state.clone());
         }
         
         self.update_file_mode();
@@ -134,10 +140,14 @@ impl DocumentManager {
             new_file_counter: 0,
             highlighting_state: {
                 let mut service = global_highlighting_service();
-                service.create_highlighting_state("Untitled.txt")
+                let state = service.create_highlighting_state("Untitled.txt");
+                Rc::new(RefCell::new(state))
             },
         };
         self.gen_untitled_name(&mut doc);
+        
+        // Register highlighting for this buffer
+        register_buffer_highlighting(&*doc.buffer.borrow(), doc.highlighting_state.clone());
 
         self.list.push_front(doc);
         Ok(self.list.front_mut().unwrap())
@@ -198,10 +208,14 @@ impl DocumentManager {
             new_file_counter: 0,
             highlighting_state: {
                 let mut service = global_highlighting_service();
-                service.create_highlighting_state(&path)
+                let state = service.create_highlighting_state(&path);
+                Rc::new(RefCell::new(state))
             },
         };
         doc.set_path(path);
+        
+        // Register highlighting for this buffer
+        register_buffer_highlighting(&*doc.buffer.borrow(), doc.highlighting_state.clone());
 
         if let Some(active) = self.active()
             && active.path.is_none()

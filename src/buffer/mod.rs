@@ -22,6 +22,8 @@
 
 mod gap_buffer;
 mod navigation;
+mod highlighting_render;
+mod text_change_notifier;
 
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
@@ -1663,7 +1665,16 @@ impl TextBuffer {
                 visual_pos_x_max = visual_pos_x_max.max(cursor_end.visual_pos.x);
             }
 
-            fb.replace_text(destination.top + y, destination.left, destination.right, &line);
+            // Use syntax highlighting if available
+            highlighting_render::render_highlighted_line(
+                fb,
+                self,
+                &line,
+                visual_line as usize,
+                destination.top + y,
+                destination.left,
+                destination.right,
+            );
 
             // Draw the selection on this line, if any.
             // FYI: `cursor_beg.visual_pos.y == visual_line` is necessary as the `visual_line`
@@ -2249,6 +2260,22 @@ impl TextBuffer {
             debug_assert!(!entry.deleted.is_empty() || !entry.added.is_empty());
         }
 
+        // Notify highlighting system about the text change
+        let (cursor_before, cursor_after, was_deletion) = {
+            let entry = self.undo_stack.back_mut().unwrap().borrow();
+            let cursor_before = entry.cursor;
+            let cursor_after = self.cursor.logical_pos;
+            let was_deletion = !entry.deleted.is_empty();
+            (cursor_before, cursor_after, was_deletion)
+        };
+        
+        text_change_notifier::notify_edit_operation(
+            self,
+            cursor_before,
+            cursor_after,
+            was_deletion,
+        );
+
         if let Some(info) = self.active_edit_line_info.take() {
             let deleted_count = self.undo_stack.back_mut().unwrap().borrow_mut().deleted.len();
             let target = self.cursor.logical_pos;
@@ -2394,6 +2421,17 @@ impl TextBuffer {
             if self.undo_stack.is_empty() {
                 self.last_history_type = HistoryType::Other;
             }
+        }
+
+        // Notify highlighting system about the undo/redo operation
+        {
+            let change = if undo { self.redo_stack.back().unwrap() } else { self.undo_stack.back().unwrap() };
+            let change = change.borrow();
+            let start_line = change.cursor.y.min(change.cursor_before.y) as usize;
+            let end_line = change.cursor.y.max(change.cursor_before.y) as usize;
+            let line_delta = (self.stats.logical_lines as isize) - (change.stats_before.logical_lines as isize);
+            
+            text_change_notifier::notify_undo_redo(self, start_line, end_line, line_delta);
         }
 
         // Also takes care of clearing `cursor_for_rendering`.
