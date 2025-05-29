@@ -33,7 +33,7 @@ This editor pays homage to the classic [MS-DOS Editor](https://en.wikipedia.org/
 
 ## Syntax Highlighting System
 
-Edit includes a comprehensive syntax highlighting system built on the Synoptic library, designed to provide fast, accurate highlighting for common programming languages while maintaining Edit's core principles of simplicity and performance.
+Edit now includes a comprehensive syntax highlighting system built on the Synoptic library, designed to provide fast, accurate highlighting for common programming languages while maintaining Edit's core principles of simplicity and performance.
 
 ### Architecture Overview
 
@@ -41,33 +41,33 @@ The syntax highlighting system is implemented as a modular, performance-first ar
 
 #### Core Components
 
-**🎨 HighlightingService** - Central service managing all syntax highlighting operations
+**HighlightingService** - Central service managing all syntax highlighting operations
 - **Global State Management**: Singleton service accessible throughout the application
 - **Language Detection**: Automatic language identification based on file extensions
 - **Highlighter Caching**: Per-language highlighter instances with lazy initialization
 - **Performance Monitoring**: Built-in metrics collection and performance tracking
 - **Configuration Management**: Global and per-file highlighting settings
 
-**📝 HighlightingState** - Per-document highlighting state and cache management
+**HighlightingState** - Per-document highlighting state and cache management
 - **Token Caching**: Line-level token cache with content hash validation
 - **Viewport Tracking**: Current editor viewport for optimized highlighting
 - **Background Queue**: Intelligent pre-highlighting of nearby lines
 - **Dirty Line Tracking**: Efficient incremental re-highlighting on edits
 - **Performance Metrics**: Document-specific timing and cache statistics
 
-**🔍 SyntaxHighlighter** - Synoptic wrapper with language-specific configurations
+**SyntaxHighlighter** - Synoptic wrapper with language-specific configurations
 - **Lazy Initialization**: Highlighters created only when needed
 - **Language Rules**: Comprehensive regex-based highlighting patterns
 - **Multi-threading Support**: Worker thread integration for timeout protection
 - **Token Generation**: Conversion from Synoptic output to Edit's TokenInfo format
 
-**🌈 ColorMapper** - Token-to-color mapping with terminal compatibility
+**ColorMapper** - Token-to-color mapping with terminal compatibility
 - **Theme Support**: Default color schemes with customization options
 - **Terminal Adaptation**: 256-color vs 16-color terminal detection
 - **Color Fallbacks**: Graceful degradation for limited color terminals
 - **Accessibility**: High-contrast color choices for readability
 
-**🔗 RenderBridge** - Integration layer between highlighting and text rendering
+**RenderBridge** - Integration layer between highlighting and text rendering
 - **Buffer Registration**: Associates highlighting states with text buffers
 - **Viewport Integration**: Coordinates highlighting with editor scrolling
 - **Background Processing**: Manages off-viewport highlighting tasks
@@ -76,18 +76,18 @@ The syntax highlighting system is implemented as a modular, performance-first ar
 ### Language Support
 
 #### Tier 1 Languages (Fully Implemented)
-- **🦀 Rust** - Complete highlighting with keywords, types, strings, comments, attributes, numbers
-- **📜 JavaScript/TypeScript** - ES6+ features, template literals, JSX support, built-in objects
-- **🐍 Python** - Keywords, built-ins, string interpolation, decorators, type hints
-- **📄 JSON** - Strings, numbers, booleans, null values, structural validation
+- **Rust** - Complete highlighting with keywords, types, strings, comments, attributes, numbers
+- **JavaScript/TypeScript** - ES6+ features, template literals, JSX support, built-in objects
+- **Python** - Keywords, built-ins, string interpolation, decorators, type hints
+- **JSON** - Strings, numbers, booleans, null values, structural validation
 
 #### Tier 2 Languages (Extended Support)
-- **🌐 HTML** - Tags, attributes, nested content structure
-- **🎨 CSS** - Selectors, properties, values, vendor prefixes
-- **📚 Markdown** - Headers, emphasis, links, code blocks, lists
-- **⚙️ YAML** - Keys, values, structure, multi-line strings
-- **🔧 TOML** - Sections, key-value pairs, data types
-- **🗃️ SQL** - Keywords, strings, operators, common dialects
+- **HTML** - Tags, attributes, nested content structure
+- **CSS** - Selectors, properties, values, vendor prefixes
+- **Markdown** - Headers, emphasis, links, code blocks, lists
+- **YAML** - Keys, values, structure, multi-line strings
+- **TOML** - Sections, key-value pairs, data types
+- **SQL** - Keywords, strings, operators, common dialects
 
 ### Performance Architecture
 
