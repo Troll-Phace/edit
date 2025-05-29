@@ -32,6 +32,7 @@ use edit::framebuffer::{self, IndexedColor};
 use edit::helpers::{KIBI, MEBI, MetricFormatter, Rect, Size};
 use edit::input::{self, kbmod, vk};
 use edit::oklab::oklab_blend;
+use edit::syntax::process_background_highlighting;
 use edit::tui::*;
 use edit::vt::{self, Token};
 use edit::{apperr, arena_format, base64, path, sys};
@@ -174,6 +175,9 @@ fn run() -> apperr::Result<()> {
             break;
         }
 
+        // Process background highlighting during idle time
+        process_background_highlighting_for_state(&mut state);
+
         // Render the UI and write it to the terminal.
         {
             let scratch = scratch_arena(None);
@@ -235,6 +239,55 @@ fn run() -> apperr::Result<()> {
     }
 
     Ok(())
+}
+
+/// Processes background highlighting for the active text buffer during idle time.
+fn process_background_highlighting_for_state(state: &mut State) {
+    // Only process if we have an active document
+    if let Some(doc) = state.documents.active() {
+        let buffer = doc.buffer.borrow();
+        
+        // Create a closure to get line content for background highlighting
+        let get_line_content = |line_number: usize| -> Option<String> {
+            if line_number < buffer.logical_line_count() as usize {
+                // Extract line content from the buffer using the new public API
+                let logical_pos = edit::helpers::Point { x: 0, y: line_number as edit::helpers::CoordType };
+                let line_end_pos = edit::helpers::Point { 
+                    x: edit::helpers::CoordType::MAX, 
+                    y: line_number as edit::helpers::CoordType 
+                };
+                
+                // Get offsets without moving the cursor
+                let line_start_offset = buffer.get_offset_at_logical_pos(logical_pos);
+                let line_end_offset = buffer.get_offset_at_logical_pos(line_end_pos);
+                
+                if line_start_offset != line_end_offset {
+                    let chunk = buffer.read_forward(line_start_offset);
+                    let chunk_len = (line_end_offset - line_start_offset).min(chunk.len());
+                    let line_bytes = &chunk[..chunk_len];
+                    
+                    // Convert to string, handling invalid UTF-8
+                    match String::from_utf8(line_bytes.to_vec()) {
+                        Ok(s) => Some(s),
+                        Err(_) => Some(String::from_utf8_lossy(line_bytes).to_string())
+                    }
+                } else {
+                    Some(String::new()) // Empty line
+                }
+            } else {
+                None
+            }
+        };
+        
+        // Process background highlighting
+        if let Some(count) = process_background_highlighting(&*buffer, get_line_content) {
+            if count > 0 {
+                // Successfully highlighted some lines in the background
+                #[cfg(debug_assertions)]
+                eprintln!("Background highlighted {} lines", count);
+            }
+        }
+    }
 }
 
 // Returns true if the application should exit early.

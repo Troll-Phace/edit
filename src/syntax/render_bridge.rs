@@ -63,6 +63,85 @@ pub fn get_line_tokens(buffer: &TextBuffer, line_content: &str, line_number: usi
     }
 }
 
+/// Gets syntax highlighting tokens for a specific line in a buffer with viewport tracking.
+/// This version also updates the viewport information for background highlighting.
+/// Returns None if no highlighting is available for the buffer.
+pub fn get_line_tokens_with_viewport(
+    buffer: &TextBuffer, 
+    line_content: &str, 
+    line_number: usize,
+    viewport_start: usize,
+    viewport_end: usize,
+) -> Option<Vec<TokenInfo>> {
+    let state_rc = get_buffer_highlighting(buffer)?;
+    let mut state = state_rc.borrow_mut();
+    
+    if !state.enabled {
+        return None;
+    }
+    
+    // Update viewport information for background highlighting
+    let mut service = global_highlighting_service();
+    service.update_viewport(&mut state, viewport_start, viewport_end);
+    
+    // Get highlighting for the current line
+    match service.highlight_line(&mut state, line_content, line_number) {
+        Ok(tokens) => Some(tokens),
+        Err(_) => None,
+    }
+}
+
+/// Performs background highlighting for lines near the viewport.
+/// This should be called during idle time to pre-highlight nearby lines.
+/// 
+/// # Arguments
+/// 
+/// * `buffer` - The text buffer to highlight
+/// * `get_line_content` - A closure that returns line content for a given line number
+/// 
+/// # Returns
+/// 
+/// The number of lines highlighted in the background, or None if no highlighting state exists.
+pub fn process_background_highlighting<F>(buffer: &TextBuffer, get_line_content: F) -> Option<usize>
+where
+    F: FnMut(usize) -> Option<String>,
+{
+    let state_rc = get_buffer_highlighting(buffer)?;
+    let mut state = state_rc.borrow_mut();
+    
+    if !state.enabled {
+        return Some(0);
+    }
+    
+    // Get the highlighting service and process background work
+    let mut service = global_highlighting_service();
+    let count = service.highlight_background_batch(&mut state, get_line_content);
+    
+    Some(count)
+}
+
+/// Returns true if there is background highlighting work available for a buffer.
+pub fn has_background_work(buffer: &TextBuffer) -> bool {
+    if let Some(state_rc) = get_buffer_highlighting(buffer) {
+        let state = state_rc.borrow();
+        state.has_background_work()
+    } else {
+        false
+    }
+}
+
+/// Updates viewport information for background highlighting without performing highlighting.
+/// This is useful for tracking viewport changes during scrolling.
+pub fn update_viewport_tracking(buffer: &TextBuffer, viewport_start: usize, viewport_end: usize) {
+    if let Some(state_rc) = get_buffer_highlighting(buffer) {
+        let mut state = state_rc.borrow_mut();
+        if state.enabled {
+            let mut service = global_highlighting_service();
+            service.update_viewport(&mut state, viewport_start, viewport_end);
+        }
+    }
+}
+
 /// Clears all buffer-highlighting associations.
 /// This should be called when the application is shutting down or resetting.
 pub fn clear_all_highlighting_associations() {

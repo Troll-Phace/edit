@@ -1448,6 +1448,13 @@ impl TextBuffer {
         unsafe { self.set_cursor(self.cursor_move_delta_internal(self.cursor, granularity, delta)) }
     }
 
+    /// Gets the byte offset for a given logical position without permanently moving the cursor.
+    /// This is useful for extracting text content at specific line positions.
+    pub fn get_offset_at_logical_pos(&self, pos: Point) -> usize {
+        let cursor = self.cursor_move_to_logical_internal(self.cursor, pos);
+        cursor.offset
+    }
+
     /// Sets the cursor to the given position, and clears the selection.
     ///
     /// # Safety

@@ -5,7 +5,7 @@
 
 use crate::framebuffer::Framebuffer;
 use crate::helpers::{CoordType, Rect};
-use crate::syntax::{get_line_tokens, global_color_mapper, TokenInfo};
+use crate::syntax::{get_line_tokens, get_line_tokens_with_viewport, global_color_mapper, TokenInfo};
 use crate::buffer::TextBuffer;
 
 /// Renders a line of text with syntax highlighting to the framebuffer.
@@ -21,8 +21,33 @@ pub fn render_highlighted_line(
     left: CoordType,
     right: CoordType,
 ) {
-    // Try to get syntax tokens for this line
-    if let Some(tokens) = get_line_tokens(buffer, line_content, line_number) {
+    render_highlighted_line_with_viewport(fb, buffer, line_content, line_number, y, left, right, None, None);
+}
+
+/// Renders a line of text with syntax highlighting to the framebuffer with viewport information.
+/// 
+/// This function replaces the standard `fb.replace_text` call with multiple
+/// calls that apply appropriate colors to each syntax token.
+pub fn render_highlighted_line_with_viewport(
+    fb: &mut Framebuffer,
+    buffer: &TextBuffer,
+    line_content: &str,
+    line_number: usize,
+    y: CoordType,
+    left: CoordType,
+    right: CoordType,
+    viewport_start: Option<usize>,
+    viewport_end: Option<usize>,
+) {
+    // Try to get syntax tokens for this line with viewport information
+    let tokens = if let (Some(start), Some(end)) = (viewport_start, viewport_end) {
+        get_line_tokens_with_viewport(buffer, line_content, line_number, start, end)
+    } else {
+        // Fallback to basic highlighting without viewport tracking
+        get_line_tokens(buffer, line_content, line_number)
+    };
+    
+    if let Some(tokens) = tokens {
         if !tokens.is_empty() {
             render_with_tokens(fb, &tokens, y, left, right);
             return;

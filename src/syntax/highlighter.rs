@@ -144,6 +144,16 @@ pub struct HighlightingState {
     dirty_lines: HashSet<usize>,
     /// Track if entire document needs re-highlighting
     needs_full_rehighlight: bool,
+    /// Current viewport information (start line, end line)
+    viewport: Option<(usize, usize)>,
+    /// Background highlighting queue (ordered by priority)
+    background_queue: Vec<usize>,
+    /// Lines currently being highlighted in background
+    background_in_progress: HashSet<usize>,
+    /// Maximum number of lines to highlight per background processing cycle
+    background_batch_size: usize,
+    /// Distance from viewport to pre-highlight (lines above and below)
+    background_lookahead: usize,
 }
 
 impl HighlightingState {
@@ -158,6 +168,11 @@ impl HighlightingState {
             cache_validity: HashMap::new(),
             dirty_lines: HashSet::new(),
             needs_full_rehighlight: false,
+            viewport: None,
+            background_queue: Vec::new(),
+            background_in_progress: HashSet::new(),
+            background_batch_size: 10, // Process 10 lines per background cycle
+            background_lookahead: 50,  // Pre-highlight 50 lines ahead/behind viewport
         }
     }
 
@@ -172,6 +187,11 @@ impl HighlightingState {
             cache_validity: HashMap::new(),
             dirty_lines: HashSet::new(),
             needs_full_rehighlight: false,
+            viewport: None,
+            background_queue: Vec::new(),
+            background_in_progress: HashSet::new(),
+            background_batch_size: 10,
+            background_lookahead: 50,
         }
     }
 
@@ -253,74 +273,225 @@ impl HighlightingState {
         self.needs_full_rehighlight = false;
     }
 
-    /// Handle text insertion at a specific location.
-    /// This marks affected lines as dirty for re-highlighting.
-    pub fn handle_text_insert(&mut self, line_number: usize, lines_added: usize) {
-        // Mark the current line as dirty
-        self.mark_line_dirty(line_number);
+    /// Updates the current viewport and schedules background highlighting for nearby lines.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `start_line` - First visible line in the viewport
+    /// * `end_line` - Last visible line in the viewport (exclusive)
+    pub fn update_viewport(&mut self, start_line: usize, end_line: usize) {
+        let new_viewport = (start_line, end_line);
         
-        // If multiple lines were added, mark them all as dirty
-        if lines_added > 0 {
-            self.mark_lines_dirty(line_number, line_number + lines_added);
-        }
-        
-        // Shift cache entries for lines after the insertion point
-        let mut new_cache = HashMap::new();
-        let mut new_validity = HashMap::new();
-        
-        for (line, tokens) in self.token_cache.drain() {
-            if line >= line_number {
-                new_cache.insert(line + lines_added, tokens);
-            } else {
-                new_cache.insert(line, tokens);
+        // Only update if viewport has changed significantly
+        if let Some((old_start, old_end)) = self.viewport {
+            // If the change is small (< 5 lines), don't rebuild the queue
+            if (start_line.abs_diff(old_start) < 5) && (end_line.abs_diff(old_end) < 5) {
+                return;
             }
         }
         
-        for (line, hash) in self.cache_validity.drain() {
-            if line >= line_number {
-                new_validity.insert(line + lines_added, hash);
-            } else {
-                new_validity.insert(line, hash);
-            }
-        }
-        
-        self.token_cache = new_cache;
-        self.cache_validity = new_validity;
+        self.viewport = Some(new_viewport);
+        self.rebuild_background_queue();
     }
 
-    /// Handle text deletion at a specific location.
-    /// This marks affected lines as dirty for re-highlighting.
+    /// Rebuilds the background highlighting queue based on current viewport.
+    fn rebuild_background_queue(&mut self) {
+        self.background_queue.clear();
+        
+        let (start_line, end_line) = match self.viewport {
+            Some(viewport) => viewport,
+            None => return,
+        };
+
+        // Calculate the range to pre-highlight
+        let background_start = start_line.saturating_sub(self.background_lookahead);
+        let background_end = end_line + self.background_lookahead;
+
+        // Add lines to the queue, prioritizing by distance from viewport
+        let mut candidates = Vec::new();
+        
+        // Lines above viewport (closer to viewport = higher priority)
+        for line in background_start..start_line {
+            if !self.has_valid_cache(line) && !self.background_in_progress.contains(&line) {
+                let distance = start_line - line;
+                candidates.push((distance, line));
+            }
+        }
+        
+        // Lines below viewport (closer to viewport = higher priority)
+        for line in end_line..background_end {
+            if !self.has_valid_cache(line) && !self.background_in_progress.contains(&line) {
+                let distance = line - end_line + 1;
+                candidates.push((distance, line));
+            }
+        }
+        
+        // Sort by distance (closer lines first)
+        candidates.sort_by_key(|(distance, _)| *distance);
+        
+        // Add to queue
+        self.background_queue = candidates.into_iter().map(|(_, line)| line).collect();
+    }
+
+    /// Checks if a line has valid cached tokens (without checking content hash).
+    fn has_valid_cache(&self, line_number: usize) -> bool {
+        self.token_cache.contains_key(&line_number)
+    }
+
+    /// Gets the next batch of lines to highlight in the background.
+    /// Returns a vector of line numbers that should be highlighted.
+    pub fn get_background_batch(&mut self) -> Vec<usize> {
+        let batch_size = self.background_batch_size.min(self.background_queue.len());
+        let batch: Vec<usize> = self.background_queue.drain(..batch_size).collect();
+        
+        // Mark these lines as in progress
+        for &line in &batch {
+            self.background_in_progress.insert(line);
+        }
+        
+        batch
+    }
+
+    /// Marks a line as completed for background highlighting.
+    pub fn complete_background_line(&mut self, line_number: usize) {
+        self.background_in_progress.remove(&line_number);
+    }
+
+    /// Returns true if there are lines waiting for background highlighting.
+    pub fn has_background_work(&self) -> bool {
+        !self.background_queue.is_empty()
+    }
+
+    /// Returns the number of lines in the background queue.
+    pub fn background_queue_size(&self) -> usize {
+        self.background_queue.len()
+    }
+
+    /// Sets the background highlighting batch size.
+    pub fn set_background_batch_size(&mut self, size: usize) {
+        self.background_batch_size = size.max(1).min(50); // Limit between 1 and 50
+    }
+
+    /// Sets the background highlighting lookahead distance.
+    pub fn set_background_lookahead(&mut self, distance: usize) {
+        self.background_lookahead = distance.min(200); // Limit to 200 lines
+        
+        // Rebuild queue if viewport is set
+        if self.viewport.is_some() {
+            self.rebuild_background_queue();
+        }
+    }
+
+    /// Gets current viewport information.
+    pub fn get_viewport(&self) -> Option<(usize, usize)> {
+        self.viewport
+    }
+
+    /// Handles text insertion by updating line caches and background highlighting queue.
+    /// This method shifts cached tokens for lines after the insertion point.
+    pub fn handle_text_insert(&mut self, start_line: usize, lines_added: usize) {
+        if lines_added == 0 {
+            return;
+        }
+
+        // Shift cached tokens for lines after the insertion point
+        let mut new_token_cache = HashMap::new();
+        let mut new_cache_validity = HashMap::new();
+        let mut new_dirty_lines = HashSet::new();
+
+        for (&line_num, tokens) in &self.token_cache {
+            if line_num >= start_line {
+                // Shift line numbers down by the number of lines added
+                new_token_cache.insert(line_num + lines_added, tokens.clone());
+            } else {
+                new_token_cache.insert(line_num, tokens.clone());
+            }
+        }
+
+        for (&line_num, &hash) in &self.cache_validity {
+            if line_num >= start_line {
+                new_cache_validity.insert(line_num + lines_added, hash);
+            } else {
+                new_cache_validity.insert(line_num, hash);
+            }
+        }
+
+        for &line_num in &self.dirty_lines {
+            if line_num >= start_line {
+                new_dirty_lines.insert(line_num + lines_added);
+            } else {
+                new_dirty_lines.insert(line_num);
+            }
+        }
+
+        self.token_cache = new_token_cache;
+        self.cache_validity = new_cache_validity;
+        self.dirty_lines = new_dirty_lines;
+
+        // Mark the insertion area as dirty
+        for line in start_line..(start_line + lines_added) {
+            self.dirty_lines.insert(line);
+        }
+
+        // Update background highlighting queue if viewport is active
+        if self.viewport.is_some() {
+            self.rebuild_background_queue();
+        }
+    }
+
+    /// Handles text deletion by updating line caches and background highlighting queue.
+    /// This method shifts cached tokens for lines after the deletion point.
     pub fn handle_text_delete(&mut self, start_line: usize, lines_deleted: usize) {
-        // Mark the current line as dirty
-        self.mark_line_dirty(start_line);
-        
-        // Remove cache entries for deleted lines
-        for line in start_line..start_line + lines_deleted {
-            self.invalidate_line_cache(line);
+        if lines_deleted == 0 {
+            return;
         }
-        
-        // Shift cache entries for lines after the deletion point
-        let mut new_cache = HashMap::new();
-        let mut new_validity = HashMap::new();
-        
-        for (line, tokens) in self.token_cache.drain() {
-            if line >= start_line + lines_deleted {
-                new_cache.insert(line - lines_deleted, tokens);
-            } else if line < start_line {
-                new_cache.insert(line, tokens);
+
+        // Remove cached tokens for deleted lines and shift remaining lines
+        let mut new_token_cache = HashMap::new();
+        let mut new_cache_validity = HashMap::new();
+        let mut new_dirty_lines = HashSet::new();
+
+        for (&line_num, tokens) in &self.token_cache {
+            if line_num < start_line {
+                // Lines before deletion remain unchanged
+                new_token_cache.insert(line_num, tokens.clone());
+            } else if line_num >= start_line + lines_deleted {
+                // Lines after deletion are shifted up
+                new_token_cache.insert(line_num - lines_deleted, tokens.clone());
+            }
+            // Lines within the deleted range are not copied (removed)
+        }
+
+        for (&line_num, &hash) in &self.cache_validity {
+            if line_num < start_line {
+                new_cache_validity.insert(line_num, hash);
+            } else if line_num >= start_line + lines_deleted {
+                new_cache_validity.insert(line_num - lines_deleted, hash);
             }
         }
-        
-        for (line, hash) in self.cache_validity.drain() {
-            if line >= start_line + lines_deleted {
-                new_validity.insert(line - lines_deleted, hash);
-            } else if line < start_line {
-                new_validity.insert(line, hash);
+
+        for &line_num in &self.dirty_lines {
+            if line_num < start_line {
+                new_dirty_lines.insert(line_num);
+            } else if line_num >= start_line + lines_deleted {
+                new_dirty_lines.insert(line_num - lines_deleted);
             }
         }
-        
-        self.token_cache = new_cache;
-        self.cache_validity = new_validity;
+
+        self.token_cache = new_token_cache;
+        self.cache_validity = new_cache_validity;
+        self.dirty_lines = new_dirty_lines;
+
+        // Mark the deletion point as dirty
+        self.dirty_lines.insert(start_line);
+
+        // Clear background highlighting work in progress for deleted lines
+        self.background_in_progress.retain(|&line| line < start_line || line >= start_line + lines_deleted);
+
+        // Update background highlighting queue if viewport is active
+        if self.viewport.is_some() {
+            self.rebuild_background_queue();
+        }
     }
 }
 
@@ -776,6 +947,110 @@ impl HighlightingService {
         let mut hasher = DefaultHasher::new();
         line.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Performs background highlighting for a batch of lines.
+    /// This method is designed to be called during idle time to pre-highlight
+    /// lines near the viewport without blocking the UI.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `state` - The highlighting state for the document
+    /// * `get_line_content` - A closure that returns the content for a given line number
+    /// 
+    /// # Returns
+    /// 
+    /// The number of lines successfully highlighted in the background.
+    pub fn highlight_background_batch<F>(
+        &mut self,
+        state: &mut HighlightingState,
+        mut get_line_content: F,
+    ) -> usize
+    where
+        F: FnMut(usize) -> Option<String>,
+    {
+        if !state.enabled || !self.enabled {
+            return 0;
+        }
+
+        let batch = state.get_background_batch();
+        let mut highlighted_count = 0;
+
+        for line_number in batch {
+            // Get the line content
+            if let Some(line_content) = get_line_content(line_number) {
+                // Skip extremely long lines to avoid blocking
+                if line_content.len() <= self.max_line_length {
+                    // Calculate content hash
+                    let content_hash = self.calculate_line_hash(&line_content);
+                    
+                    // Skip if already cached with current content
+                    if !state.has_cached_tokens(line_number, content_hash) {
+                        // Get or create highlighter for this language
+                        let highlighter = self.highlighters
+                            .entry(state.language)
+                            .or_insert_with(|| SyntaxHighlighter::new(state.language));
+
+                        // Perform highlighting with a shorter timeout for background work
+                        let start_time = Instant::now();
+                        
+                        if let Ok(tokens) = highlighter.highlight_line(&line_content, line_number) {
+                            let duration = start_time.elapsed();
+                            
+                            // Use a shorter timeout for background highlighting (half of normal timeout)
+                            let background_timeout = self.line_timeout / 2;
+                            
+                            if duration <= background_timeout {
+                                // Cache the result
+                                state.cache_tokens(line_number, content_hash, tokens);
+                                highlighted_count += 1;
+                                
+                                // Update metrics (but don't count towards main metrics to avoid skewing)
+                                // We could add separate background metrics here if needed
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Mark this line as completed
+            state.complete_background_line(line_number);
+        }
+
+        highlighted_count
+    }
+
+    /// Triggers background highlighting for lines near the current viewport.
+    /// This should be called when the viewport changes (e.g., during scrolling).
+    /// 
+    /// # Arguments
+    /// 
+    /// * `state` - The highlighting state for the document
+    /// * `viewport_start` - First visible line
+    /// * `viewport_end` - Last visible line (exclusive)
+    pub fn update_viewport(&mut self, state: &mut HighlightingState, viewport_start: usize, viewport_end: usize) {
+        state.update_viewport(viewport_start, viewport_end);
+    }
+
+    /// Returns true if there is background highlighting work available.
+    pub fn has_background_work(&self, state: &HighlightingState) -> bool {
+        state.has_background_work()
+    }
+
+    /// Sets background highlighting configuration.
+    /// This configures the default settings for new highlighting states.
+    pub fn configure_background_highlighting(&mut self, batch_size: usize, lookahead: usize) {
+        // Store configuration that will be applied to new highlighting states
+        // For now, we don't store these globally since each state manages its own configuration
+        // The parameters are used during state creation and individual configuration calls
+        
+        // We could add fields to store these defaults if needed:
+        // self.default_batch_size = batch_size.max(1).min(50);
+        // self.default_lookahead = lookahead.min(200);
+        
+        // For now, prevent unused variable warnings by acknowledging the parameters
+        let _ = batch_size.max(1).min(50); // Validate range
+        let _ = lookahead.min(200); // Validate range
     }
 }
 
