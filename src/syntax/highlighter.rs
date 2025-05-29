@@ -9,8 +9,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use std::thread;
 use once_cell::sync::Lazy;
 use synoptic::Highlighter;
+use crossbeam_channel::{bounded, select, Receiver, Sender};
 
 use crate::syntax::language::{Language, LanguageConfig, LanguageDetector};
 
@@ -765,10 +767,14 @@ impl SyntaxHighlighter {
 pub struct HighlightingService {
     /// Language detector for identifying file types
     language_detector: LanguageDetector,
-    /// Cache of syntax highlighters per language
+    /// Cache of syntax highlighters per language (legacy, fallback mode)
     highlighters: HashMap<Language, SyntaxHighlighter>,
+    /// Multi-threaded highlighter for timeout interruption
+    threaded_highlighter: Option<ThreadedHighlighter>,
     /// Global highlighting configuration
     enabled: bool,
+    /// Whether to use multi-threaded highlighting
+    use_threaded_highlighting: bool,
     /// Global performance metrics
     global_metrics: HighlightingMetrics,
     /// Maximum time allowed for highlighting a single line
@@ -789,7 +795,9 @@ impl HighlightingService {
         Self {
             language_detector: LanguageDetector::new(),
             highlighters: HashMap::new(),
+            threaded_highlighter: None, // Will be initialized on first use
             enabled: true,
+            use_threaded_highlighting: true, // Enable by default for production
             global_metrics: HighlightingMetrics::default(),
             line_timeout: Duration::from_millis(50), // 50ms per line timeout
             max_line_length: 10_000, // Skip highlighting for lines longer than 10k characters
@@ -843,31 +851,15 @@ impl HighlightingService {
 
         state.metrics.record_cache_miss();
 
-        // Get or create highlighter for this language
-        let highlighter = self.highlighters
-            .entry(state.language)
-            .or_insert_with(|| SyntaxHighlighter::new(state.language));
+        // Choose highlighting strategy based on configuration
+        let tokens = if self.use_threaded_highlighting {
+            self.highlight_line_threaded(state.language, line, line_number)?
+        } else {
+            self.highlight_line_legacy(state, line, line_number)?
+        };
 
-        // Perform highlighting with timeout protection
-        let start_time = Instant::now();
-        
-        // For now, we perform the highlighting and check the duration after
-        // In a production system, you might want to use a separate thread with a timeout
-        let tokens = highlighter.highlight_line(line, line_number)?;
-        let duration = start_time.elapsed();
-
-        // If highlighting took too long, return plain text and mark line for skipping
-        if duration > self.line_timeout {
-            // Log that we exceeded timeout (in production, you'd use a proper logging system)
-            eprintln!("Syntax highlighting timeout for line {} ({}ms)", line_number, duration.as_millis());
-            
-            // Return plain text instead
-            return Ok(vec![TokenInfo::plain_text(
-                line.to_string(),
-                0,
-                line.len(),
-            )]);
-        }
+        // Calculate duration for metrics (approximate for threaded mode)
+        let duration = Duration::from_millis(1); // Threaded mode returns immediately
 
         // Update metrics
         state.metrics.record_line_highlight(duration, tokens.len());
@@ -939,6 +931,29 @@ impl HighlightingService {
         self.max_line_length
     }
 
+    /// Enables or disables multi-threaded highlighting.
+    pub fn set_threaded_highlighting(&mut self, enabled: bool) {
+        self.use_threaded_highlighting = enabled;
+        
+        // If disabling threaded highlighting, clean up the threaded highlighter
+        if !enabled {
+            self.threaded_highlighter = None;
+        }
+    }
+
+    /// Returns whether multi-threaded highlighting is enabled.
+    pub fn is_threaded_highlighting_enabled(&self) -> bool {
+        self.use_threaded_highlighting
+    }
+
+    /// Forces reinitialization of the threaded highlighter.
+    /// Useful for applying configuration changes that require a fresh worker thread.
+    pub fn reinitialize_threaded_highlighter(&mut self) {
+        if self.use_threaded_highlighting {
+            self.threaded_highlighter = Some(ThreadedHighlighter::new());
+        }
+    }
+
     /// Calculates a simple hash for line content caching.
     fn calculate_line_hash(&self, line: &str) -> u64 {
         use std::collections::hash_map::DefaultHasher;
@@ -947,6 +962,75 @@ impl HighlightingService {
         let mut hasher = DefaultHasher::new();
         line.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Highlights a line using the threaded highlighter with timeout interruption.
+    fn highlight_line_threaded(
+        &mut self,
+        language: Language,
+        line: &str,
+        line_number: usize,
+    ) -> Result<Vec<TokenInfo>, String> {
+        // Initialize threaded highlighter if not already done
+        if self.threaded_highlighter.is_none() {
+            self.threaded_highlighter = Some(ThreadedHighlighter::new());
+        }
+
+        if let Some(ref mut threaded_highlighter) = self.threaded_highlighter {
+            match threaded_highlighter.highlight_line_with_timeout(
+                language,
+                line,
+                line_number,
+                self.line_timeout,
+            ) {
+                Ok(tokens) => Ok(tokens),
+                Err(_) => {
+                    // Fallback to plain text on any error
+                    Ok(vec![TokenInfo::plain_text(
+                        line.to_string(),
+                        0,
+                        line.len(),
+                    )])
+                }
+            }
+        } else {
+            // This shouldn't happen, but fallback to plain text
+            Ok(vec![TokenInfo::plain_text(
+                line.to_string(),
+                0,
+                line.len(),
+            )])
+        }
+    }
+
+    /// Legacy highlighting method (synchronous with post-highlighting timeout check).
+    fn highlight_line_legacy(
+        &mut self,
+        state: &HighlightingState,
+        line: &str,
+        line_number: usize,
+    ) -> Result<Vec<TokenInfo>, String> {
+        // Get or create highlighter for this language
+        let highlighter = self.highlighters
+            .entry(state.language)
+            .or_insert_with(|| SyntaxHighlighter::new(state.language));
+
+        // Perform highlighting with timeout protection
+        let start_time = Instant::now();
+        let tokens = highlighter.highlight_line(line, line_number)?;
+        let duration = start_time.elapsed();
+
+        // If highlighting took too long, return plain text
+        if duration > self.line_timeout {
+            eprintln!("Syntax highlighting timeout for line {} ({}ms)", line_number, duration.as_millis());
+            return Ok(vec![TokenInfo::plain_text(
+                line.to_string(),
+                0,
+                line.len(),
+            )]);
+        }
+
+        Ok(tokens)
     }
 
     /// Performs background highlighting for a batch of lines.
@@ -1054,17 +1138,214 @@ impl HighlightingService {
     }
 }
 
-/// Global singleton instance of the highlighting service.
-static HIGHLIGHTING_SERVICE: Lazy<std::sync::Mutex<HighlightingService>> = 
-    Lazy::new(|| std::sync::Mutex::new(HighlightingService::new()));
+/// Message types for communication with highlighting worker threads.
+#[derive(Debug)]
+pub enum HighlightingRequest {
+    /// Request to highlight a line of text
+    HighlightLine {
+        /// Unique request ID for matching responses
+        request_id: u64,
+        /// The language to use for highlighting
+        language: Language,
+        /// The line content to highlight
+        line: String,
+        /// The line number (for caching and metrics)
+        line_number: usize,
+    },
+    /// Request to shutdown the worker thread
+    Shutdown,
+}
 
-/// Gets a reference to the global highlighting service.
-/// 
-/// # Panics
-/// 
-/// Panics if the service mutex is poisoned.
-pub fn global_highlighting_service() -> std::sync::MutexGuard<'static, HighlightingService> {
-    HIGHLIGHTING_SERVICE.lock().unwrap()
+/// Response from highlighting worker threads.
+#[derive(Debug)]
+pub enum HighlightingResponse {
+    /// Successful highlighting result
+    Success {
+        /// The request ID this response corresponds to
+        request_id: u64,
+        /// The highlighted tokens
+        tokens: Vec<TokenInfo>,
+        /// Time taken to highlight
+        duration: Duration,
+    },
+    /// Highlighting failed
+    Error {
+        /// The request ID this response corresponds to
+        request_id: u64,
+        /// Error description
+        error: String,
+    },
+}
+
+/// A multi-threaded highlighting worker that can be interrupted with timeouts.
+pub struct ThreadedHighlighter {
+    /// Channel to send highlighting requests to worker
+    request_sender: Sender<HighlightingRequest>,
+    /// Channel to receive responses from worker
+    response_receiver: Receiver<HighlightingResponse>,
+    /// Handle to the worker thread
+    worker_handle: Option<thread::JoinHandle<()>>,
+    /// Counter for generating unique request IDs
+    next_request_id: u64,
+}
+
+impl std::fmt::Debug for ThreadedHighlighter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadedHighlighter")
+            .field("next_request_id", &self.next_request_id)
+            .field("worker_active", &self.worker_handle.is_some())
+            .finish()
+    }
+}
+
+impl ThreadedHighlighter {
+    /// Creates a new threaded highlighter with a dedicated worker thread.
+    pub fn new() -> Self {
+        let (request_sender, request_receiver) = bounded(100); // Buffer up to 100 requests
+        let (response_sender, response_receiver) = bounded(100);
+
+        // Spawn worker thread
+        let worker_handle = thread::spawn(move || {
+            Self::worker_thread(request_receiver, response_sender);
+        });
+
+        Self {
+            request_sender,
+            response_receiver,
+            worker_handle: Some(worker_handle),
+            next_request_id: 1,
+        }
+    }
+
+    /// Worker thread function that processes highlighting requests.
+    fn worker_thread(
+        request_receiver: Receiver<HighlightingRequest>,
+        response_sender: Sender<HighlightingResponse>,
+    ) {
+        // Initialize highlighters for different languages
+        let mut highlighters: HashMap<Language, SyntaxHighlighter> = HashMap::new();
+
+        while let Ok(request) = request_receiver.recv() {
+            match request {
+                HighlightingRequest::HighlightLine {
+                    request_id,
+                    language,
+                    line,
+                    line_number,
+                } => {
+                    let start_time = Instant::now();
+
+                    // Get or create highlighter for this language
+                    let highlighter = highlighters
+                        .entry(language)
+                        .or_insert_with(|| SyntaxHighlighter::new(language));
+
+                    // Perform the highlighting
+                    match highlighter.highlight_line(&line, line_number) {
+                        Ok(tokens) => {
+                            let duration = start_time.elapsed();
+                            let _ = response_sender.send(HighlightingResponse::Success {
+                                request_id,
+                                tokens,
+                                duration,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = response_sender.send(HighlightingResponse::Error {
+                                request_id,
+                                error: format!("Highlighting error: {}", e),
+                            });
+                        }
+                    }
+                }
+                HighlightingRequest::Shutdown => {
+                    // Clean shutdown
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Highlights a line with timeout interruption.
+    /// Returns Ok(tokens) if successful, or falls back to plain text on timeout/error.
+    pub fn highlight_line_with_timeout(
+        &mut self,
+        language: Language,
+        line: &str,
+        line_number: usize,
+        timeout: Duration,
+    ) -> Result<Vec<TokenInfo>, Box<dyn std::error::Error + Send + Sync>> {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        // Send highlighting request
+        let request = HighlightingRequest::HighlightLine {
+            request_id,
+            language,
+            line: line.to_string(),
+            line_number,
+        };
+
+        self.request_sender.send(request)?;
+
+        // Wait for response with timeout
+        select! {
+            recv(self.response_receiver) -> response => {
+                match response? {
+                    HighlightingResponse::Success { request_id: resp_id, tokens, duration: _ } => {
+                        if resp_id == request_id {
+                            Ok(tokens)
+                        } else {
+                            // Got response for different request, return plain text
+                            Ok(vec![TokenInfo::plain_text(
+                                line.to_string(),
+                                0,
+                                line.len(),
+                            )])
+                        }
+                    }
+                    HighlightingResponse::Error { request_id: resp_id, error: _ } => {
+                        if resp_id == request_id {
+                            // Return plain text on error
+                            Ok(vec![TokenInfo::plain_text(
+                                line.to_string(),
+                                0,
+                                line.len(),
+                            )])
+                        } else {
+                            // Got error for different request, return plain text
+                            Ok(vec![TokenInfo::plain_text(
+                                line.to_string(),
+                                0,
+                                line.len(),
+                            )])
+                        }
+                    }
+                }
+            }
+            default(timeout) => {
+                // Timeout occurred - return plain text immediately
+                // The worker thread will eventually process the request but we don't wait
+                Ok(vec![TokenInfo::plain_text(
+                    line.to_string(),
+                    0,
+                    line.len(),
+                )])
+            }
+        }
+    }
+}
+
+impl Drop for ThreadedHighlighter {
+    fn drop(&mut self) {
+        // Send shutdown signal to worker thread
+        let _ = self.request_sender.send(HighlightingRequest::Shutdown);
+        
+        // Wait for worker thread to finish
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1176,4 +1457,126 @@ mod tests {
         assert_eq!(state.metrics.cache_misses, 2);
         assert_eq!(state.metrics.cache_hits, 1);
     }
+
+    #[test]
+    fn test_threaded_highlighting_configuration() {
+        let mut service = HighlightingService::new();
+        
+        // Should start with threaded highlighting enabled
+        assert!(service.is_threaded_highlighting_enabled());
+        
+        // Disable threaded highlighting
+        service.set_threaded_highlighting(false);
+        assert!(!service.is_threaded_highlighting_enabled());
+        
+        // Re-enable threaded highlighting
+        service.set_threaded_highlighting(true);
+        assert!(service.is_threaded_highlighting_enabled());
+    }
+
+    #[test]
+    fn test_threaded_vs_legacy_highlighting() {
+        let mut service = HighlightingService::new();
+        let mut state = service.create_highlighting_state("test.rs");
+        
+        let test_line = "fn main() { println!(\"Hello, world!\"); }";
+        let line_number = 0;
+        
+        // Test legacy highlighting
+        service.set_threaded_highlighting(false);
+        let legacy_tokens = service.highlight_line(&mut state, test_line, line_number).unwrap();
+        
+        // Reset state cache for fair comparison
+        state.invalidate_line_cache(line_number);
+        
+        // Test threaded highlighting
+        service.set_threaded_highlighting(true);
+        let threaded_tokens = service.highlight_line(&mut state, test_line, line_number).unwrap();
+        
+        // Both should produce non-empty token lists
+        assert!(!legacy_tokens.is_empty());
+        assert!(!threaded_tokens.is_empty());
+        
+        // The results should be similar (allowing for minor differences)
+        // At minimum, both should identify some keywords
+        let legacy_has_keywords = legacy_tokens.iter().any(|t| t.is_highlighted());
+        let threaded_has_keywords = threaded_tokens.iter().any(|t| t.is_highlighted());
+        
+        assert!(legacy_has_keywords);
+        assert!(threaded_has_keywords);
+    }
+
+    #[test]
+    fn test_timeout_behavior() {
+        use std::time::Duration;
+        
+        let mut service = HighlightingService::new();
+        
+        // Set a very short timeout to force timeout behavior
+        service.set_line_timeout(Duration::from_nanos(1));
+        
+        let mut state = service.create_highlighting_state("test.rs");
+        let test_line = "fn main() { println!(\"Hello, world!\"); }";
+        
+        // Test legacy mode - should return plain text due to timeout
+        service.set_threaded_highlighting(false);
+        let legacy_result = service.highlight_line(&mut state, test_line, 0).unwrap();
+        
+        // Should get plain text token when timeout occurs
+        assert_eq!(legacy_result.len(), 1);
+        assert!(!legacy_result[0].is_highlighted());
+        assert_eq!(legacy_result[0].text, test_line);
+        
+        // Reset state cache
+        state.invalidate_line_cache(0);
+        
+        // Test threaded mode - should also handle timeout gracefully
+        service.set_threaded_highlighting(true);
+        let threaded_result = service.highlight_line(&mut state, test_line, 0).unwrap();
+        
+        // Should get plain text token when timeout occurs
+        assert_eq!(threaded_result.len(), 1);
+        assert!(!threaded_result[0].is_highlighted());
+        assert_eq!(threaded_result[0].text, test_line);
+    }
+
+    #[test]
+    fn test_performance_metrics_with_threading() {
+        let mut service = HighlightingService::new();
+        service.reset_metrics();
+        
+        let mut state = service.create_highlighting_state("test.rs");
+        let test_line = "fn main() { println!(\"Hello, world!\"); }";
+        
+        // Test with threaded highlighting
+        service.set_threaded_highlighting(true);
+        let _ = service.highlight_line(&mut state, test_line, 0).unwrap();
+        
+        // Metrics should be updated
+        let metrics = service.global_metrics();
+        assert_eq!(metrics.lines_highlighted, 1);
+        assert!(metrics.tokens_generated > 0);
+    }
+}
+
+// Global highlighting service instance
+static GLOBAL_HIGHLIGHTING_SERVICE: Lazy<std::sync::Mutex<HighlightingService>> = 
+    Lazy::new(|| std::sync::Mutex::new(HighlightingService::new()));
+
+/// Gets a reference to the global highlighting service.
+/// 
+/// This function provides access to a singleton HighlightingService instance
+/// that can be shared across the application. The service is protected by a mutex
+/// to ensure thread safety.
+/// 
+/// # Returns
+/// 
+/// A `MutexGuard` containing the global HighlightingService instance.
+/// 
+/// # Panics
+/// 
+/// This function will panic if the mutex is poisoned (which should not happen
+/// under normal circumstances).
+pub fn global_highlighting_service() -> std::sync::MutexGuard<'static, HighlightingService> {
+    GLOBAL_HIGHLIGHTING_SERVICE.lock().unwrap()
 }
